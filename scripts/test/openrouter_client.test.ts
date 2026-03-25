@@ -13,6 +13,7 @@ import {
   classifyIssueViaOpenRouter,
   buildClassificationMessages,
   parseClassificationContent,
+  filterKiroCompatible,
   sanitizeInput,
   KIRO_MODELS,
   DEFAULT_MODEL,
@@ -699,5 +700,190 @@ describe("Full classification round-trip (mocked network)", () => {
 
     expect(result.recommended_labels).toEqual([]);
     expect(result.error).toBeUndefined();
+  });
+});
+
+// ─── Prompt caching ───────────────────────────────────────────────────────────
+
+describe("Prompt caching", () => {
+  let client: OpenRouterClient;
+
+  beforeEach(() => {
+    client = new OpenRouterClient({ apiKey: TEST_API_KEY, enableCache: true });
+  });
+
+  it("exposes enableCache=true when configured", () => {
+    expect(client.enableCache).toBe(true);
+  });
+
+  it("enableCache defaults to false", () => {
+    const c = new OpenRouterClient({ apiKey: TEST_API_KEY });
+    expect(c.enableCache).toBe(false);
+  });
+
+  it("converts the system message content to a ContentBlock array with cache_control", async () => {
+    global.fetch = mockFetchResponse(makeChatResponse("ok"));
+
+    await client.chat([
+      { role: "system", content: "You are a classifier." },
+      { role: "user",   content: "Classify this." },
+    ]);
+
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    const systemMsg = body.messages[0];
+
+    expect(Array.isArray(systemMsg.content)).toBe(true);
+    expect(systemMsg.content[0].type).toBe("text");
+    expect(systemMsg.content[0].text).toBe("You are a classifier.");
+    expect(systemMsg.content[0].cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("does NOT cache the user message", async () => {
+    global.fetch = mockFetchResponse(makeChatResponse("ok"));
+
+    await client.chat([
+      { role: "system", content: "System prompt." },
+      { role: "user",   content: "User input." },
+    ]);
+
+    const body    = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    const userMsg = body.messages[1];
+
+    // User message should remain a plain string (no cache_control)
+    expect(typeof userMsg.content).toBe("string");
+    expect(userMsg.content).toBe("User input.");
+  });
+
+  it("can override cache per-call with cache:false even when enableCache=true", async () => {
+    global.fetch = mockFetchResponse(makeChatResponse("ok"));
+
+    await client.chat(
+      [{ role: "system", content: "Prompt." }, { role: "user", content: "Q." }],
+      { cache: false }
+    );
+
+    const body      = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    const systemMsg = body.messages[0];
+
+    // Without cache the system message content stays as a string
+    expect(typeof systemMsg.content).toBe("string");
+  });
+
+  it("can enable cache per-call even when enableCache=false on the client", async () => {
+    const noCache = new OpenRouterClient({ apiKey: TEST_API_KEY, enableCache: false });
+    global.fetch  = mockFetchResponse(makeChatResponse("ok"));
+
+    await noCache.chat(
+      [{ role: "system", content: "Prompt." }, { role: "user", content: "Q." }],
+      { cache: true }
+    );
+
+    const body      = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    const systemMsg = body.messages[0];
+
+    expect(Array.isArray(systemMsg.content)).toBe(true);
+    expect(systemMsg.content[0].cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("extractCacheStats returns cache details when present in usage", () => {
+    const response: OpenRouterResponse = {
+      ...makeChatResponse("ok"),
+      usage: {
+        prompt_tokens:          1000,
+        completion_tokens:      100,
+        total_tokens:           1100,
+        prompt_tokens_details: { cached_tokens: 900, cache_write_tokens: 100 },
+      },
+    };
+
+    const stats = client.extractCacheStats(response);
+
+    expect(stats).not.toBeNull();
+    expect(stats!.cached_tokens).toBe(900);
+    expect(stats!.cache_write_tokens).toBe(100);
+  });
+
+  it("extractCacheStats returns null when usage has no prompt_tokens_details", () => {
+    const response = makeChatResponse("ok");
+    expect(client.extractCacheStats(response)).toBeNull();
+  });
+
+  it("extractCacheStats returns null when usage is absent", () => {
+    const response: OpenRouterResponse = { ...makeChatResponse("ok"), usage: undefined };
+    expect(client.extractCacheStats(response)).toBeNull();
+  });
+});
+
+// ─── Model selection ──────────────────────────────────────────────────────────
+
+describe("Model selection", () => {
+  it("KIRO_MODELS contains only anthropic/* IDs", () => {
+    for (const id of Object.values(KIRO_MODELS)) {
+      expect(id).toMatch(/^anthropic\//);
+    }
+  });
+
+  it("all KIRO_MODELS values are non-empty strings", () => {
+    for (const id of Object.values(KIRO_MODELS)) {
+      expect(typeof id).toBe("string");
+      expect(id.length).toBeGreaterThan(0);
+    }
+  });
+
+  describe("filterKiroCompatible()", () => {
+    const allModels: OpenRouterModel[] = [
+      { id: "anthropic/claude-sonnet-4",   name: "Claude Sonnet 4"   },
+      { id: "anthropic/claude-3.5-haiku",  name: "Claude Haiku 3.5"  },
+      { id: "openai/gpt-4o",               name: "GPT-4o"            },
+      { id: "google/gemini-2.0-flash",     name: "Gemini 2.0 Flash"  },
+      { id: "meta-llama/llama-3.1-8b",     name: "Llama 3.1 8B"      },
+    ];
+
+    it("keeps only anthropic/* models", () => {
+      const result = filterKiroCompatible(allModels);
+      expect(result.every((m) => m.id.startsWith("anthropic/"))).toBe(true);
+    });
+
+    it("filters out non-anthropic models", () => {
+      const result = filterKiroCompatible(allModels);
+      expect(result.find((m) => m.id === "openai/gpt-4o")).toBeUndefined();
+      expect(result.find((m) => m.id === "google/gemini-2.0-flash")).toBeUndefined();
+    });
+
+    it("returns correct count", () => {
+      expect(filterKiroCompatible(allModels)).toHaveLength(2);
+    });
+
+    it("returns empty array when no anthropic models present", () => {
+      const nonAnthropicModels: OpenRouterModel[] = [
+        { id: "openai/gpt-4o", name: "GPT-4o" },
+      ];
+      expect(filterKiroCompatible(nonAnthropicModels)).toEqual([]);
+    });
+
+    it("returns all models when all are anthropic", () => {
+      const anthropicOnly: OpenRouterModel[] = [
+        { id: "anthropic/claude-sonnet-4", name: "Sonnet 4" },
+        { id: "anthropic/claude-opus-4",   name: "Opus 4"   },
+      ];
+      expect(filterKiroCompatible(anthropicOnly)).toHaveLength(2);
+    });
+  });
+
+  describe("OpenRouterClient.listKiroCompatibleModels()", () => {
+    it("returns only anthropic models from listModels", async () => {
+      const client = new OpenRouterClient({ apiKey: TEST_API_KEY });
+      global.fetch = mockFetchResponse({
+        data: [
+          { id: "anthropic/claude-sonnet-4", name: "Sonnet 4" },
+          { id: "openai/gpt-4o",             name: "GPT-4o"   },
+        ],
+      });
+
+      const result = await client.listKiroCompatibleModels();
+
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe("anthropic/claude-sonnet-4");
+    });
   });
 });

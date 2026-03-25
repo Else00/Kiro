@@ -5,6 +5,23 @@
  *
  * OpenRouter exposes an OpenAI-compatible REST API at https://openrouter.ai/api/v1
  * Authentication: Bearer token via OPENROUTER_API_KEY environment variable.
+ *
+ * ─── Billing note ────────────────────────────────────────────────────────────
+ * OpenRouter uses its OWN credit system (purchased at openrouter.ai/credits).
+ * It is NOT compatible with Kiro IDE credits, which are a separate product.
+ * If you already have AWS credentials you can use BYOK (Bring Your Own Key)
+ * via OpenRouter to avoid purchasing OpenRouter credits; set up at
+ * https://openrouter.ai/settings/integrations.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ─── Prompt caching ──────────────────────────────────────────────────────────
+ * Anthropic models on OpenRouter support prompt caching.
+ * Enable it by passing `enableCache: true` in the config (or per-request via
+ * the `cache` option). The system message (which contains the large taxonomy
+ * prompt) is marked with a `cache_control` breakpoint so repeated calls with
+ * the same taxonomy are billed at the reduced cached-token rate.
+ * Cache hit/write metrics are available in response.usage.prompt_tokens_details.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import { ClassificationResult, LabelTaxonomy } from "./data_models.js";
@@ -14,17 +31,29 @@ import { retryWithBackoff } from "./retry_utils.js";
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
-/** Models usable through OpenRouter that match Kiro's AI stack */
+/**
+ * Kiro-compatible models available on OpenRouter.
+ *
+ * These mirror the Claude models used by Kiro internally (via Bedrock) and can
+ * be selected by passing the model ID in OpenRouterClientConfig or as the
+ * OPENROUTER_MODEL environment variable.
+ *
+ * Pricing reference: https://openrouter.ai/models?q=anthropic
+ */
 export const KIRO_MODELS = {
-  CLAUDE_SONNET_4:     "anthropic/claude-sonnet-4",
-  CLAUDE_SONNET_3_5:   "anthropic/claude-3.5-sonnet",
-  CLAUDE_HAIKU_3_5:    "anthropic/claude-3.5-haiku",
-  CLAUDE_OPUS_4:       "anthropic/claude-opus-4",
+  /** Best quality – used by Kiro's internal Bedrock classifier */
+  CLAUDE_SONNET_4:   "anthropic/claude-sonnet-4",
+  /** Good quality, lower latency */
+  CLAUDE_SONNET_3_5: "anthropic/claude-3.5-sonnet",
+  /** Fastest / cheapest for high-volume tasks */
+  CLAUDE_HAIKU_3_5:  "anthropic/claude-3.5-haiku",
+  /** Highest quality for complex reasoning */
+  CLAUDE_OPUS_4:     "anthropic/claude-opus-4",
 } as const;
 
 export type KiroModelId = (typeof KIRO_MODELS)[keyof typeof KIRO_MODELS];
 
-/** Default model mirrors the Bedrock model used in the rest of the codebase */
+/** Default model mirrors the Bedrock model used in bedrock_classifier.ts */
 export const DEFAULT_MODEL: KiroModelId = KIRO_MODELS.CLAUDE_SONNET_4;
 
 // Security: Maximum lengths for input validation
@@ -38,9 +67,31 @@ const DEFAULT_TOP_P       = 0.9;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Anthropic-style prompt cache control marker.
+ * Adding this to a content block tells the model to cache everything up to
+ * (and including) that block. Up to 4 breakpoints are supported per request.
+ */
+export interface CacheControl {
+  type: "ephemeral";
+}
+
+/** A single text block within a message's content array. */
+export interface ContentBlock {
+  type: "text";
+  text: string;
+  /** Present only when prompt caching is requested for this block. */
+  cache_control?: CacheControl;
+}
+
+/**
+ * An OpenRouter chat message.
+ * `content` can be a plain string OR an array of ContentBlocks.
+ * Use the array form when you need to attach cache_control to specific blocks.
+ */
 export interface OpenRouterMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  content: string | ContentBlock[];
 }
 
 export interface OpenRouterRequest {
@@ -61,10 +112,20 @@ export interface OpenRouterChoice {
   finish_reason: string;
 }
 
+/** Cache hit/write token counts returned by Anthropic models via OpenRouter. */
+export interface PromptTokensDetails {
+  /** Tokens read from cache (you are billed at ~10 % of normal rate). */
+  cached_tokens?: number;
+  /** Tokens written to cache on first request (billed at ~125 % of normal rate). */
+  cache_write_tokens?: number;
+}
+
 export interface OpenRouterUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Only present for Anthropic models when prompt caching is active. */
+  prompt_tokens_details?: PromptTokensDetails;
 }
 
 export interface OpenRouterResponse {
@@ -92,13 +153,23 @@ export interface OpenRouterModel {
 export interface OpenRouterClientConfig {
   /** OpenRouter API key. Falls back to OPENROUTER_API_KEY env var. */
   apiKey?: string;
-  /** Model ID to use. Falls back to OPENROUTER_MODEL env var, then DEFAULT_MODEL. */
+  /**
+   * Model ID to use. Falls back to OPENROUTER_MODEL env var, then DEFAULT_MODEL.
+   * Use one of the KIRO_MODELS constants or any model ID from openrouter.ai/models.
+   */
   model?: string;
   /** Override the base URL (useful for testing). */
   baseUrl?: string;
   maxTokens?: number;
   temperature?: number;
   topP?: number;
+  /**
+   * Enable Anthropic prompt caching for supported models.
+   * When true, the system/taxonomy message is marked with a cache_control
+   * breakpoint, reducing cost on repeated calls with the same prompt.
+   * Only effective with anthropic/* models routed through OpenRouter.
+   */
+  enableCache?: boolean;
 }
 
 // ─── Security helpers ─────────────────────────────────────────────────────────
@@ -151,6 +222,15 @@ export function sanitizeInput(input: string, maxLength: number): string {
  *   const client = new OpenRouterClient({ apiKey: "sk-or-..." });
  *   const response = await client.chat([{ role: "user", content: "Hello" }]);
  *   console.log(client.extractContent(response));
+ *
+ * With prompt caching (Anthropic models only):
+ *   const client = new OpenRouterClient({ apiKey: "sk-or-...", enableCache: true });
+ *
+ * With a specific model:
+ *   const client = new OpenRouterClient({
+ *     apiKey: "sk-or-...",
+ *     model: KIRO_MODELS.CLAUDE_HAIKU_3_5,   // fast & cheap
+ *   });
  */
 export class OpenRouterClient {
   private readonly apiKey: string;
@@ -159,6 +239,7 @@ export class OpenRouterClient {
   private readonly maxTokens: number;
   private readonly temperature: number;
   private readonly topP: number;
+  readonly enableCache: boolean;
 
   constructor(config: OpenRouterClientConfig = {}) {
     this.apiKey      = config.apiKey      ?? process.env.OPENROUTER_API_KEY ?? "";
@@ -167,6 +248,7 @@ export class OpenRouterClient {
     this.maxTokens   = config.maxTokens   ?? DEFAULT_MAX_TOKENS;
     this.temperature = config.temperature ?? DEFAULT_TEMPERATURE;
     this.topP        = config.topP        ?? DEFAULT_TOP_P;
+    this.enableCache = config.enableCache ?? false;
 
     if (!this.apiKey) {
       throw new Error(
@@ -181,14 +263,18 @@ export class OpenRouterClient {
   /**
    * Send a chat completion request to OpenRouter.
    * Automatically retries on transient errors (429, 500, 503, network failures).
+   *
+   * @param options.cache - Override the instance-level enableCache setting for
+   *   this individual call.
    */
   async chat(
     messages: OpenRouterMessage[],
-    options: Partial<OpenRouterRequest> = {}
+    options: Partial<OpenRouterRequest> & { cache?: boolean } = {}
   ): Promise<OpenRouterResponse> {
+    const shouldCache = options.cache ?? this.enableCache;
     const requestBody: OpenRouterRequest = {
       model:       options.model       ?? this.model,
-      messages,
+      messages:    shouldCache ? this.applyCache(messages) : messages,
       max_tokens:  options.max_tokens  ?? this.maxTokens,
       temperature: options.temperature ?? this.temperature,
       top_p:       options.top_p       ?? this.topP,
@@ -221,6 +307,7 @@ export class OpenRouterClient {
 
   /**
    * Retrieve the list of models available on OpenRouter.
+   * Use `filterKiroCompatible()` on the result to show only Kiro-compatible models.
    */
   async listModels(): Promise<OpenRouterModel[]> {
     const response = await fetch(`${this.baseUrl}/models`, {
@@ -235,6 +322,15 @@ export class OpenRouterClient {
 
     const data = (await response.json()) as { data: OpenRouterModel[] };
     return data.data ?? [];
+  }
+
+  /**
+   * Return only the Kiro-compatible models (all Anthropic Claude variants)
+   * from the full OpenRouter model list.
+   */
+  async listKiroCompatibleModels(): Promise<OpenRouterModel[]> {
+    const all = await this.listModels();
+    return filterKiroCompatible(all);
   }
 
   /**
@@ -253,25 +349,68 @@ export class OpenRouterClient {
     return response.choices[0].message.content;
   }
 
+  /**
+   * Read prompt-cache metrics from the response usage field.
+   * Returns null if the model did not return cache statistics.
+   */
+  extractCacheStats(response: OpenRouterResponse): PromptTokensDetails | null {
+    return response.usage?.prompt_tokens_details ?? null;
+  }
+
   // ── Private helpers ─────────────────────────────────────────────────────────
 
   private buildHeaders(): Record<string, string> {
     return {
       "Authorization": `Bearer ${this.apiKey}`,
       "Content-Type":  "application/json",
-      // Recommended OpenRouter headers for tracking
+      // Recommended OpenRouter headers for usage tracking and attribution
       "HTTP-Referer":  "https://github.com/kirodotdev/kiro",
       "X-Title":       "Kiro GitHub Issue Automation",
     };
   }
+
+  /**
+   * Attach a cache_control breakpoint to the last system message so that the
+   * large taxonomy/instructions block is cached across repeated calls.
+   * The user message (which changes every call) is intentionally NOT cached.
+   */
+  private applyCache(messages: OpenRouterMessage[]): OpenRouterMessage[] {
+    return messages.map((msg) => {
+      if (msg.role !== "system") return msg;
+
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : msg.content.map((b) => b.text).join("\n");
+
+      const block: ContentBlock = {
+        type:          "text",
+        text,
+        cache_control: { type: "ephemeral" },
+      };
+
+      return { role: msg.role, content: [block] };
+    });
+  }
+}
+
+// ─── Standalone helpers ───────────────────────────────────────────────────────
+
+/**
+ * Filter a model list to those that are Kiro-compatible
+ * (i.e. Anthropic Claude models, matching what Kiro uses internally).
+ */
+export function filterKiroCompatible(models: OpenRouterModel[]): OpenRouterModel[] {
+  return models.filter((m) => m.id.startsWith("anthropic/"));
 }
 
 // ─── Issue classification via OpenRouter ──────────────────────────────────────
 
 /**
  * Build a messages array for issue classification with prompt-injection guards.
- * System message contains the taxonomy and instructions; user message contains
- * the (sanitized) issue content.
+ *
+ * When `enableCache` is true the caller should pass these messages through
+ * OpenRouterClient.chat() with the `cache` option — the client will
+ * automatically attach cache_control to the system block.
  */
 export function buildClassificationMessages(
   issueTitle: string,
@@ -361,15 +500,20 @@ export function parseClassificationContent(content: string): ClassificationResul
 /**
  * Classify a GitHub issue using the OpenRouter API.
  *
- * This function is a drop-in replacement for `classifyIssue` in bedrock_classifier.ts:
- * it accepts the same arguments and returns the same ClassificationResult shape.
+ * Drop-in replacement for `classifyIssue` in bedrock_classifier.ts:
+ * same arguments, same ClassificationResult return type.
+ *
+ * @param config.enableCache  Set to true to activate Anthropic prompt caching
+ *   on the taxonomy/system message (recommended for high-volume usage).
+ * @param config.model        Override the model, e.g. KIRO_MODELS.CLAUDE_HAIKU_3_5
+ *   for a faster/cheaper variant.
  *
  * @example
  *   const result = await classifyIssueViaOpenRouter(
  *     "Agent crashes on startup",
  *     "Steps to reproduce: ...",
  *     new LabelTaxonomy(),
- *     { apiKey: process.env.OPENROUTER_API_KEY }
+ *     { apiKey: process.env.OPENROUTER_API_KEY, enableCache: true }
  *   );
  */
 export async function classifyIssueViaOpenRouter(
